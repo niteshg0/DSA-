@@ -96,14 +96,16 @@ async function flush(id) {
   clearTimeout(pending.get(id));
   pending.delete(id);
   const entry = cache.get(id);
-  if (!entry) return;
-  if (writing.has(id)) { queueFlush(id); return; }
+  if (!entry) return true;
+  if (writing.has(id)) { queueFlush(id); return true; }
   writing.add(id);
   try {
     await ghWrite(entry);
+    return true;
   } catch (err) {
     console.error(err.message);
     queueFlush(id); // try again later; the record stays in memory
+    return false;
   } finally {
     writing.delete(id);
   }
@@ -132,8 +134,24 @@ async function writeUser(rec, { now = false } = {}) {
   const entry = cache.get(rec.id) || {};
   entry.rec = rec;
   cache.set(rec.id, entry);
-  if (now) await flush(rec.id);
-  else queueFlush(rec.id);
+  if (!now) { queueFlush(rec.id); return; }
+  if (await flush(rec.id)) return;
+  if (!entry.sha) { // never reached GitHub: forget it so the account isn't half-created
+    clearTimeout(pending.get(rec.id));
+    pending.delete(rec.id);
+    cache.delete(rec.id);
+  }
+  throw new Error('Could not save to GitHub. Check the server log.');
+}
+
+// Log a clear message at startup if the data repo or branch can't be reached.
+async function checkGitHub() {
+  const res = await gh('https://api.github.com/repos/' + GH_REPO + '/branches/' + encodeURIComponent(GH_BRANCH));
+  if (res.ok) { console.log('GitHub storage OK: ' + GH_REPO + ' (' + GH_BRANCH + ')'); return; }
+  const hint = res.status === 401 ? 'GITHUB_TOKEN is invalid or expired.'
+    : res.status === 404 ? 'Repo or branch not found, or the token has no access to it. Check GITHUB_REPO is "owner/repo", the repo has a README (so ' + GH_BRANCH + ' exists), and the token is scoped to this repo.'
+    : await res.text();
+  console.error('GitHub storage problem (' + res.status + '): ' + hint);
 }
 
 /* ---------- passwords ---------- */
@@ -311,4 +329,5 @@ server.listen(PORT, HOST, () => {
   console.log(USE_GITHUB
     ? 'Accounts save to github.com/' + GH_REPO + ' (' + GH_BRANCH + ') in ' + GH_DIR + '/'
     : 'Accounts save to ' + usersDir);
+  if (USE_GITHUB) checkGitHub().catch((err) => console.error('GitHub storage check failed: ' + err.message));
 });
